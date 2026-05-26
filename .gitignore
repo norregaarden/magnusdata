@@ -1,6 +1,9 @@
 # dependencies (bun install)
 node_modules
 
+*.json
+sessions.json
+
 # output
 out
 dist
