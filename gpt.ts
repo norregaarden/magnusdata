@@ -1,5 +1,7 @@
-// gpt.ts
-import path from "node:path";
+// gpt.ts — Session Analyzer
+// Consolidated pipeline: CSV / XLSX / ZIP → parsed sessions → partitions + cross-tabs → JSON
+// Magic byte sniffing, graceful degradation, informative errors, no "by duration" bloat.
+
 import { readdir, readFile, writeFile, stat } from "node:fs/promises";
 import { join, basename, extname } from "node:path";
 import { unzipSync } from "node:zlib";
@@ -37,6 +39,16 @@ export interface Partition {
   count: number;
   proportionSeconds: number;
   proportionPixels: number;
+  avgDurationSeconds: number;
+  pixelsPerSecond: number;
+}
+
+export interface CrossTab {
+  rowKey: string;
+  colKey: string;
+  totalSeconds: number;
+  totalPixels: number;
+  count: number;
 }
 
 export interface SessionAnalysis {
@@ -44,6 +56,7 @@ export interface SessionAnalysis {
   totalSeconds: number;
   totalPixels: number;
   partitions: Map<string, Partition[]>;
+  crossTabs: Map<string, CrossTab[]>;
 }
 
 export interface GlobalAnalysis {
@@ -51,6 +64,7 @@ export interface GlobalAnalysis {
   grandTotalSeconds: number;
   grandTotalPixels: number;
   globalPartitions: Map<string, Partition[]>;
+  globalCrossTabs: Map<string, CrossTab[]>;
 }
 
 //
@@ -61,36 +75,27 @@ type FileKind = "csv" | "xlsx" | "zip" | "unknown";
 
 function detectFileKind(buffer: Buffer): FileKind {
   if (buffer.length < 4) return "unknown";
+  const [b0, b1, b2, b3] = [buffer[0], buffer[1], buffer[2], buffer[3]];
 
-  const b0 = buffer[0];
-  const b1 = buffer[1];
-  const b2 = buffer[2];
-  const b3 = buffer[3];
-
-  // ZIP: PK\x03\x04 or PK\x05\x06 or PK\x07\x08
+  // ZIP local file header, empty archive, or spanned archive
   if (b0 === 0x50 && b1 === 0x4B) {
-    if (b2 === 0x03 && b3 === 0x04) return "zip";
-    if (b2 === 0x05 && b3 === 0x06) return "zip";
-    if (b2 === 0x07 && b3 === 0x08) return "zip";
+    if ((b2 === 0x03 && b3 === 0x04) ||
+        (b2 === 0x05 && b3 === 0x06) ||
+        (b2 === 0x07 && b3 === 0x08)) {
+      return "zip";
+    }
   }
 
-  // XLSX is a ZIP container, but we distinguish by trying to parse as workbook
-  // For now, treat all valid ZIPs as "zip" and let xlsx parser fail fast if not a workbook
-
-  // XLS (BIFF): BOF record \xD0\xCF\x11\xE0 (CFB container)
+  // XLS (BIFF / CFB container) — old Excel, xlsx library handles it
   if (b0 === 0xD0 && b1 === 0xCF && b2 === 0x11 && b3 === 0xE0) {
-    // This is XLS (old Excel) — xlsx library handles it, but we route through xlsxToCsvText
-    return "xlsx"; // umbrella term for Excel formats
+    return "xlsx"; // umbrella for Excel formats
   }
-
-  // CSV/Text: heuristic — if mostly printable ASCII/UTF8 and contains commas
-  // We don't detect CSV by magic bytes; we use extension + content fallback
 
   return "unknown";
 }
 
 //
-// Time parser
+// Time parser — handles M:SS, MM:SS, H:MM:SS, Excel serial, empty
 //
 
 function parseTimeToSeconds(time: string | number): number {
@@ -109,20 +114,14 @@ function parseTimeToSeconds(time: string | number): number {
   if (parts.some(Number.isNaN)) {
     throw new Error(`Invalid time format (non-numeric): "${time}"`);
   }
-  if (parts.length === 2) {
-    const [m, s] = parts;
-    return m * 60 + s;
-  }
-  if (parts.length === 3) {
-    const [h, m, s] = parts;
-    return h * 3600 + m * 60 + s;
-  }
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
 
   throw new Error(`Invalid time format: "${time}" (expected MM:SS or HH:MM:SS)`);
 }
 
 //
-// CSV tokenizer
+// CSV tokenizer — proper quote handling
 //
 
 function parseCsvLine(line: string): string[] {
@@ -154,7 +153,7 @@ function parseCsvLine(line: string): string[] {
 }
 
 //
-// THE ONE AND ONLY PARSER
+// THE ONE AND ONLY PARSER — with column confirmation
 //
 
 export function parseSessionCsv(csvText: string, fileName: string): Session {
@@ -164,7 +163,16 @@ export function parseSessionCsv(csvText: string, fileName: string): Session {
     .filter(Boolean);
 
   if (lines.length < 3) {
-    throw new Error(`Too few lines: ${lines.length} (need at least 3: session name, headers, data)`);
+    throw new Error(`Too few lines: ${lines.length} (need session name, headers, data)`);
+  }
+
+  // Confirm headers
+  const headers = parseCsvLine(lines[1]).map(h => h.toLowerCase().trim());
+  const expected = ["activity", "description", "start", "end", "duration", "pixels"];
+  const missing = expected.filter(e => !headers.includes(e));
+  if (missing.length > 0) {
+    console.error(`  ⚠ ${fileName}: missing expected columns: ${missing.join(", ")}`);
+    console.error(`  ⚠ Found headers: ${headers.join(", ")}`);
   }
 
   const firstRow = parseCsvLine(lines[0]);
@@ -228,13 +236,12 @@ async function extractSource(filePath: string): Promise<{ path: string; text: st
   const ext = extname(filePath).toLowerCase();
   const kind = detectFileKind(buffer);
 
-  // Route 1: Explicit CSV extension or CSV-like content
+  // Route 1: Explicit CSV
   if (ext === ".csv") {
     try {
       const text = buffer.toString("utf8");
-      // Validate: must have commas and multiple lines
       if (!text.includes(",") || text.split("\n").length < 3) {
-        console.error(`  ⚠ ${filePath}: has .csv extension but looks empty or malformed (no commas or <3 lines)`);
+        console.error(`  ⚠ ${filePath}: .csv extension but empty or malformed (no commas or <3 lines)`);
         return null;
       }
       return { path: filePath, text };
@@ -244,7 +251,7 @@ async function extractSource(filePath: string): Promise<{ path: string; text: st
     }
   }
 
-  // Route 2: Excel formats (.xlsx, .xls) — try xlsx library
+  // Route 2: Excel formats
   if (ext === ".xlsx" || ext === ".xls" || kind === "xlsx") {
     try {
       const text = xlsxToCsvText(buffer);
@@ -266,7 +273,6 @@ async function extractSource(filePath: string): Promise<{ path: string; text: st
       extracted = unzipSync(buffer);
     } catch (e) {
       console.error(`  ⚠ ${filePath}: not a valid ZIP (${e instanceof Error ? e.message : String(e)}) — trying as XLSX...`);
-      // Fallback: maybe it's a misnamed .xlsx (which IS a zip, but could be corrupted)
       try {
         const text = xlsxToCsvText(buffer);
         return { path: filePath, text };
@@ -280,6 +286,7 @@ async function extractSource(filePath: string): Promise<{ path: string; text: st
     for (const [name, innerBuf] of Object.entries(extracted)) {
       const innerExt = extname(name).toLowerCase();
       const innerPath = `${filePath}#${name}`;
+
       if (innerExt === ".csv") {
         try {
           const text = innerBuf.toString("utf8");
@@ -292,6 +299,7 @@ async function extractSource(filePath: string): Promise<{ path: string; text: st
           console.error(`    ✗ ${innerPath}: invalid UTF-8 (${e instanceof Error ? e.message : String(e)})`);
         }
       }
+
       if (innerExt === ".xlsx" || innerExt === ".xls") {
         try {
           const text = xlsxToCsvText(innerBuf);
@@ -311,7 +319,7 @@ async function extractSource(filePath: string): Promise<{ path: string; text: st
       return null;
     }
 
-    // Return first valid result (or all — caller flattens)
+    // Return first valid result (caller flattens if multiple)
     return results[0];
   }
 
@@ -374,7 +382,7 @@ async function autoFindSources(): Promise<{ path: string; text: string }[]> {
 }
 
 //
-// Path normalization
+// Path normalization — Windows C:\ → /mnt/c/
 //
 
 function normalizeInputPath(input: string): string {
@@ -387,7 +395,7 @@ function normalizeInputPath(input: string): string {
 }
 
 //
-// Partition engine
+// Partition engine — enriched with derived metrics
 //
 
 function getPartitionableFields(row: ActivityRow): string[] {
@@ -405,7 +413,7 @@ function makePartitions(
   const groups = new Map<string, { seconds: number; pixels: number; count: number }>();
 
   for (const row of rows) {
-    const key = String((row as any)[fieldName] ?? "");
+    const key = String((row as Record<string, unknown>)[fieldName] ?? "");
     if (!key) continue;
     const g = groups.get(key) ?? { seconds: 0, pixels: 0, count: 0 };
     g.seconds += row.durationSeconds;
@@ -424,11 +432,53 @@ function makePartitions(
       count: g.count,
       proportionSeconds: totalSeconds > 0 ? g.seconds / totalSeconds : 0,
       proportionPixels: totalPixels > 0 ? g.pixels / totalPixels : 0,
+      avgDurationSeconds: g.count > 0 ? Math.round(g.seconds / g.count) : 0,
+      pixelsPerSecond: g.seconds > 0 ? Math.round((g.pixels / g.seconds) * 100) / 100 : 0,
     });
   }
 
   return parts.sort((a, b) => b.proportionSeconds - a.proportionSeconds);
 }
+
+//
+// Cross-tabulation
+//
+
+function makeCrossTab(
+  rows: ActivityRow[],
+  rowField: string,
+  colField: string,
+): CrossTab[] {
+  const cells = new Map<string, CrossTab>();
+
+  for (const row of rows) {
+    const rKey = String((row as Record<string, unknown>)[rowField] ?? "");
+    const cKey = String((row as Record<string, unknown>)[colField] ?? "");
+    if (!rKey || !cKey) continue;
+
+    const key = `${rKey}\x00${cKey}`;
+    const existing = cells.get(key);
+    if (existing) {
+      existing.totalSeconds += row.durationSeconds;
+      existing.totalPixels += row.pixels;
+      existing.count += 1;
+    } else {
+      cells.set(key, {
+        rowKey: rKey,
+        colKey: cKey,
+        totalSeconds: row.durationSeconds,
+        totalPixels: row.pixels,
+        count: 1,
+      });
+    }
+  }
+
+  return Array.from(cells.values()).sort((a, b) => b.totalSeconds - a.totalSeconds);
+}
+
+//
+// Analysis
+//
 
 function analyzeSession(session: Session): SessionAnalysis {
   const totalSeconds = session.activities.reduce((s, r) => s + r.durationSeconds, 0);
@@ -443,7 +493,12 @@ function analyzeSession(session: Session): SessionAnalysis {
     partitions.set(field, makePartitions(session.activities, field, totalSeconds, totalPixels));
   }
 
-  return { session, totalSeconds, totalPixels, partitions };
+  const crossTabs = new Map<string, CrossTab[]>();
+  if (fields.includes("activity") && fields.includes("description")) {
+    crossTabs.set("activity×description", makeCrossTab(session.activities, "activity", "description"));
+  }
+
+  return { session, totalSeconds, totalPixels, partitions, crossTabs };
 }
 
 function analyzeGlobal(sessionAnalyses: SessionAnalysis[]): GlobalAnalysis {
@@ -461,11 +516,16 @@ function analyzeGlobal(sessionAnalyses: SessionAnalysis[]): GlobalAnalysis {
     globalPartitions.set(field, makePartitions(allRows, field, grandTotalSeconds, grandTotalPixels));
   }
 
-  return { sessions: sessionAnalyses, grandTotalSeconds, grandTotalPixels, globalPartitions };
+  const globalCrossTabs = new Map<string, CrossTab[]>();
+  if (allFields.has("activity") && allFields.has("description")) {
+    globalCrossTabs.set("activity×description", makeCrossTab(allRows, "activity", "description"));
+  }
+
+  return { sessions: sessionAnalyses, grandTotalSeconds, grandTotalPixels, globalPartitions, globalCrossTabs };
 }
 
 //
-// Formatters
+// Formatters — NO "by duration" bloat
 //
 
 function fmtTime(sec: number): string {
@@ -483,22 +543,41 @@ function fmtPct(n: number): string {
 function renderPartitionTable(parts: Partition[]): string {
   if (parts.length === 0) return "  (no data)";
   const maxKey = Math.max(8, ...parts.map(p => p.key.length));
-  const header = `${"Key".padEnd(maxKey)} | Count |   Time   | Time% | Pixels | Pix%`;
+  const header = `${"Key".padEnd(maxKey)} | Cnt |   Time   | Time% | Pixels | Pix% | AvgTime | Px/Sec`;
   const lines = parts.map(p =>
-    `${p.key.padEnd(maxKey)} | ${String(p.count).padStart(5)} | ${fmtTime(p.totalSeconds).padStart(8)} | ${fmtPct(p.proportionSeconds).padStart(5)} | ${String(p.totalPixels).padStart(6)} | ${fmtPct(p.proportionPixels).padStart(4)}`
+    `${p.key.padEnd(maxKey)} | ${String(p.count).padStart(3)} | ${fmtTime(p.totalSeconds).padStart(8)} | ${fmtPct(p.proportionSeconds).padStart(5)} | ${String(p.totalPixels).padStart(6)} | ${fmtPct(p.proportionPixels).padStart(4)} | ${fmtTime(p.avgDurationSeconds).padStart(7)} | ${p.pixelsPerSecond.toFixed(2)}`
   );
+  return [header, "-".repeat(header.length), ...lines].join("\n");
+}
+
+function renderCrossTab(tabs: CrossTab[]): string {
+  if (tabs.length === 0) return "  (no data)";
+  const maxRow = Math.max(8, ...tabs.map(t => t.rowKey.length));
+  const maxCol = Math.max(8, ...tabs.map(t => t.colKey.length));
+  const header = `${"Activity".padEnd(maxRow)} | ${"Description".padEnd(maxCol)} | Cnt |   Time   | Pixels`;
+  const lines = tabs.slice(0, 20).map(t =>
+    `${t.rowKey.padEnd(maxRow)} | ${t.colKey.padEnd(maxCol)} | ${String(t.count).padStart(3)} | ${fmtTime(t.totalSeconds).padStart(8)} | ${String(t.totalPixels).padStart(6)}`
+  );
+  if (tabs.length > 20) lines.push(`... and ${tabs.length - 20} more combinations`);
   return [header, "-".repeat(header.length), ...lines].join("\n");
 }
 
 function renderAnalysis(a: SessionAnalysis): string {
   const parts: string[] = [
-    `\nSession: ${a.session.name} (${a.session.file})`,
-    `Total: ${fmtTime(a.totalSeconds)} | ${a.totalPixels} pixels | ${a.session.activities.length} activities`,
+    `\n▓ Session: ${a.session.name} (${a.session.file})`,
+    `  Total: ${fmtTime(a.totalSeconds)} | ${a.totalPixels} pixels | ${a.session.activities.length} activities`,
   ];
+
   for (const [field, partitions] of a.partitions) {
-    parts.push(`\nBy ${field}:`);
+    parts.push(`\n  By ${field}:`);
     parts.push(renderPartitionTable(partitions));
   }
+
+  for (const [pair, tabs] of a.crossTabs) {
+    parts.push(`\n  Cross-tab ${pair}:`);
+    parts.push(renderCrossTab(tabs));
+  }
+
   return parts.join("\n");
 }
 
@@ -508,10 +587,17 @@ function renderGlobal(a: GlobalAnalysis): string {
     `GLOBAL ANALYSIS`,
     `${a.sessions.length} sessions | ${fmtTime(a.grandTotalSeconds)} total | ${a.grandTotalPixels} pixels total`,
   ];
+
   for (const [field, partitions] of a.globalPartitions) {
     parts.push(`\nGlobal by ${field}:`);
     parts.push(renderPartitionTable(partitions));
   }
+
+  for (const [pair, tabs] of a.globalCrossTabs) {
+    parts.push(`\nGlobal cross-tab ${pair}:`);
+    parts.push(renderCrossTab(tabs));
+  }
+
   parts.push(`═══════════════════════════════════════════════════════════════`);
   return parts.join("\n");
 }
