@@ -54,15 +54,48 @@ export interface GlobalAnalysis {
 }
 
 //
-// Time parser: MM:SS, HH:MM:SS, Excel serial numbers, "0", ""
+// File type detection by magic bytes — NOT extension
 //
 
-export function parseTimeToSeconds(time: string | number): number {
-  if (time === "" || time === null || time === undefined) return 0;
+type FileKind = "csv" | "xlsx" | "zip" | "unknown";
 
-  if (typeof time === "number") {
-    return Math.round(time * 24 * 60 * 60);
+function detectFileKind(buffer: Buffer): FileKind {
+  if (buffer.length < 4) return "unknown";
+
+  const b0 = buffer[0];
+  const b1 = buffer[1];
+  const b2 = buffer[2];
+  const b3 = buffer[3];
+
+  // ZIP: PK\x03\x04 or PK\x05\x06 or PK\x07\x08
+  if (b0 === 0x50 && b1 === 0x4B) {
+    if (b2 === 0x03 && b3 === 0x04) return "zip";
+    if (b2 === 0x05 && b3 === 0x06) return "zip";
+    if (b2 === 0x07 && b3 === 0x08) return "zip";
   }
+
+  // XLSX is a ZIP container, but we distinguish by trying to parse as workbook
+  // For now, treat all valid ZIPs as "zip" and let xlsx parser fail fast if not a workbook
+
+  // XLS (BIFF): BOF record \xD0\xCF\x11\xE0 (CFB container)
+  if (b0 === 0xD0 && b1 === 0xCF && b2 === 0x11 && b3 === 0xE0) {
+    // This is XLS (old Excel) — xlsx library handles it, but we route through xlsxToCsvText
+    return "xlsx"; // umbrella term for Excel formats
+  }
+
+  // CSV/Text: heuristic — if mostly printable ASCII/UTF8 and contains commas
+  // We don't detect CSV by magic bytes; we use extension + content fallback
+
+  return "unknown";
+}
+
+//
+// Time parser
+//
+
+function parseTimeToSeconds(time: string | number): number {
+  if (time === "" || time === null || time === undefined) return 0;
+  if (typeof time === "number") return Math.round(time * 24 * 60 * 60);
 
   const t = String(time).trim();
   if (!t || t === "0") return 0;
@@ -76,7 +109,6 @@ export function parseTimeToSeconds(time: string | number): number {
   if (parts.some(Number.isNaN)) {
     throw new Error(`Invalid time format (non-numeric): "${time}"`);
   }
-
   if (parts.length === 2) {
     const [m, s] = parts;
     return m * 60 + s;
@@ -90,7 +122,7 @@ export function parseTimeToSeconds(time: string | number): number {
 }
 
 //
-// Robust CSV tokenizer (RFC-4180-ish)
+// CSV tokenizer
 //
 
 function parseCsvLine(line: string): string[] {
@@ -122,7 +154,7 @@ function parseCsvLine(line: string): string[] {
 }
 
 //
-// Parse CSV text into Session — THE ONE AND ONLY PARSER
+// THE ONE AND ONLY PARSER
 //
 
 export function parseSessionCsv(csvText: string, fileName: string): Session {
@@ -132,7 +164,7 @@ export function parseSessionCsv(csvText: string, fileName: string): Session {
     .filter(Boolean);
 
   if (lines.length < 3) {
-    throw new Error(`Too few lines in ${fileName}: ${lines.length} lines (need at least 3)`);
+    throw new Error(`Too few lines: ${lines.length} (need at least 3: session name, headers, data)`);
   }
 
   const firstRow = parseCsvLine(lines[0]);
@@ -170,7 +202,7 @@ export function parseSessionCsv(csvText: string, fileName: string): Session {
 }
 
 //
-// XLSX → CSV text conversion
+// XLSX → CSV conversion
 //
 
 function xlsxToCsvText(buffer: Buffer): string {
@@ -181,7 +213,168 @@ function xlsxToCsvText(buffer: Buffer): string {
 }
 
 //
-// Path normalization: Windows C:\ → /mnt/c/
+// Consolidated source extraction — probes by content, reports clearly
+//
+
+async function extractSource(filePath: string): Promise<{ path: string; text: string } | null> {
+  let buffer: Buffer;
+  try {
+    buffer = await readFile(filePath);
+  } catch (e) {
+    console.error(`  ✗ ${filePath}: cannot read file (${e instanceof Error ? e.message : String(e)})`);
+    return null;
+  }
+
+  const ext = extname(filePath).toLowerCase();
+  const kind = detectFileKind(buffer);
+
+  // Route 1: Explicit CSV extension or CSV-like content
+  if (ext === ".csv") {
+    try {
+      const text = buffer.toString("utf8");
+      // Validate: must have commas and multiple lines
+      if (!text.includes(",") || text.split("\n").length < 3) {
+        console.error(`  ⚠ ${filePath}: has .csv extension but looks empty or malformed (no commas or <3 lines)`);
+        return null;
+      }
+      return { path: filePath, text };
+    } catch (e) {
+      console.error(`  ✗ ${filePath}: invalid UTF-8 in CSV (${e instanceof Error ? e.message : String(e)})`);
+      return null;
+    }
+  }
+
+  // Route 2: Excel formats (.xlsx, .xls) — try xlsx library
+  if (ext === ".xlsx" || ext === ".xls" || kind === "xlsx") {
+    try {
+      const text = xlsxToCsvText(buffer);
+      if (!text.includes(",") || text.split("\n").length < 3) {
+        console.error(`  ⚠ ${filePath}: XLSX converted to CSV but looks empty or malformed`);
+        return null;
+      }
+      return { path: filePath, text };
+    } catch (e) {
+      console.error(`  ✗ ${filePath}: cannot parse as XLSX (${e instanceof Error ? e.message : String(e)})`);
+      return null;
+    }
+  }
+
+  // Route 3: ZIP — extract and recurse on inner files
+  if (ext === ".zip" || kind === "zip") {
+    let extracted: Record<string, Buffer>;
+    try {
+      extracted = unzipSync(buffer);
+    } catch (e) {
+      console.error(`  ⚠ ${filePath}: not a valid ZIP (${e instanceof Error ? e.message : String(e)}) — trying as XLSX...`);
+      // Fallback: maybe it's a misnamed .xlsx (which IS a zip, but could be corrupted)
+      try {
+        const text = xlsxToCsvText(buffer);
+        return { path: filePath, text };
+      } catch (_) {
+        console.error(`  ✗ ${filePath}: neither valid ZIP nor valid XLSX`);
+        return null;
+      }
+    }
+
+    const results: { path: string; text: string }[] = [];
+    for (const [name, innerBuf] of Object.entries(extracted)) {
+      const innerExt = extname(name).toLowerCase();
+      const innerPath = `${filePath}#${name}`;
+      if (innerExt === ".csv") {
+        try {
+          const text = innerBuf.toString("utf8");
+          if (text.includes(",") && text.split("\n").length >= 3) {
+            results.push({ path: innerPath, text });
+          } else {
+            console.error(`    ⚠ ${innerPath}: inner CSV empty or malformed`);
+          }
+        } catch (e) {
+          console.error(`    ✗ ${innerPath}: invalid UTF-8 (${e instanceof Error ? e.message : String(e)})`);
+        }
+      }
+      if (innerExt === ".xlsx" || innerExt === ".xls") {
+        try {
+          const text = xlsxToCsvText(innerBuf);
+          if (text.includes(",") && text.split("\n").length >= 3) {
+            results.push({ path: innerPath, text });
+          } else {
+            console.error(`    ⚠ ${innerPath}: inner XLSX empty or malformed`);
+          }
+        } catch (e) {
+          console.error(`    ✗ ${innerPath}: cannot parse XLSX (${e instanceof Error ? e.message : String(e)})`);
+        }
+      }
+    }
+
+    if (results.length === 0) {
+      console.error(`  ⚠ ${filePath}: ZIP contains no valid CSV/XLSX files`);
+      return null;
+    }
+
+    // Return first valid result (or all — caller flattens)
+    return results[0];
+  }
+
+  console.error(`  ⚠ ${filePath}: unknown file type (ext=${ext}, magic=${kind}) — skipping`);
+  return null;
+}
+
+//
+// Directory scanning
+//
+
+async function findSources(inputPath: string): Promise<{ path: string; text: string }[]> {
+  const s = await stat(inputPath);
+
+  if (s.isFile()) {
+    const result = await extractSource(inputPath);
+    return result ? [result] : [];
+  }
+
+  if (s.isDirectory()) {
+    const entries = await readdir(inputPath, { withFileTypes: true });
+    const nested = await Promise.all(
+      entries.map(async entry => {
+        const full = join(inputPath, entry.name);
+        if (entry.isDirectory()) return findSources(full);
+        const ext = extname(full).toLowerCase();
+        if (entry.isFile() && (ext === ".csv" || ext === ".xlsx" || ext === ".xls" || ext === ".zip")) {
+          const result = await extractSource(full);
+          return result ? [result] : [];
+        }
+        return [];
+      })
+    );
+    return nested.flat();
+  }
+
+  throw new Error(`Not a file or directory: ${inputPath}`);
+}
+
+//
+// Auto-discovery: current directory, non-recursive
+//
+
+async function autoFindSources(): Promise<{ path: string; text: string }[]> {
+  const cwd = process.cwd();
+  const entries = await readdir(cwd, { withFileTypes: true });
+
+  const results: { path: string; text: string }[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const full = join(cwd, entry.name);
+    const ext = extname(full).toLowerCase();
+    if (ext === ".csv" || ext === ".xlsx" || ext === ".xls" || ext === ".zip") {
+      const result = await extractSource(full);
+      if (result) results.push(result);
+    }
+  }
+
+  return results;
+}
+
+//
+// Path normalization
 //
 
 function normalizeInputPath(input: string): string {
@@ -194,84 +387,7 @@ function normalizeInputPath(input: string): string {
 }
 
 //
-// File discovery: recursive, case-insensitive extensions
-//
-
-async function findSources(inputPath: string): Promise<{ path: string; text: string }[]> {
-  const s = await stat(inputPath);
-
-  if (s.isFile()) {
-    const ext = extname(inputPath).toLowerCase();
-    if (ext === ".csv") {
-      return [{ path: inputPath, text: await readFile(inputPath, "utf8") }];
-    }
-    if (ext === ".xlsx" || ext === ".xls") {
-      const buf = await readFile(inputPath);
-      return [{ path: inputPath, text: xlsxToCsvText(buf) }];
-    }
-    if (ext === ".zip") {
-      const zipBuffer = await readFile(inputPath);
-      const extracted = unzipSync(zipBuffer);
-      const results: { path: string; text: string }[] = [];
-      for (const [name, buffer] of Object.entries(extracted)) {
-        const innerExt = extname(name).toLowerCase();
-        if (innerExt === ".csv") {
-          results.push({ path: `${inputPath}#${name}`, text: buffer.toString("utf8") });
-        }
-        if (innerExt === ".xlsx" || innerExt === ".xls") {
-          results.push({ path: `${inputPath}#${name}`, text: xlsxToCsvText(buffer) });
-        }
-      }
-      if (results.length === 0) throw new Error(`No CSV/XLSX files found inside zip: ${inputPath}`);
-      return results;
-    }
-    throw new Error(`Unsupported file type: ${inputPath}`);
-  }
-
-  if (s.isDirectory()) {
-    const entries = await readdir(inputPath, { withFileTypes: true });
-    const nested = await Promise.all(
-      entries.map(async entry => {
-        const full = join(inputPath, entry.name);
-        if (entry.isDirectory()) return findSources(full);
-        const ext = extname(full).toLowerCase();
-        if (entry.isFile() && (ext === ".csv" || ext === ".xlsx" || ext === ".xls" || ext === ".zip")) {
-          return findSources(full);
-        }
-        return [];
-      })
-    );
-    return nested.flat();
-  }
-
-  throw new Error(`Not a file or directory: ${inputPath}`);
-}
-
-//
-// Auto-discovery: scan current directory (non-recursive)
-//
-
-async function autoFindSources(): Promise<{ path: string; text: string }[]> {
-  const cwd = process.cwd();
-  const entries = await readdir(cwd, { withFileTypes: true });
-
-  const pending: Promise<{ path: string; text: string }[]>[] = [];
-
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const full = join(cwd, entry.name);
-    const ext = extname(full).toLowerCase();
-    if (ext === ".csv" || ext === ".xlsx" || ext === ".xls" || ext === ".zip") {
-      pending.push(findSources(full));
-    }
-  }
-
-  const results = await Promise.all(pending);
-  return results.flat();
-}
-
-//
-// Dependent partition engine
+// Partition engine
 //
 
 function getPartitionableFields(row: ActivityRow): string[] {
@@ -418,7 +534,7 @@ async function main() {
     sources = await autoFindSources();
   }
 
-  console.error(`Found ${sources.length} source(s)`);
+  console.error(`Found ${sources.length} valid source(s)`);
 
   const sessions: Session[] = [];
 
@@ -428,12 +544,12 @@ async function main() {
       sessions.push(session);
       console.error(`  ✓ ${source.path} → ${session.activities.length} activities`);
     } catch (e) {
-      console.error(`  ✗ ${source.path}: ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`  ✗ ${source.path}: parse error (${e instanceof Error ? e.message : String(e)})`);
     }
   }
 
   if (sessions.length === 0) {
-    console.error("No sessions parsed successfully.");
+    console.error("\nNo sessions parsed successfully. Check error messages above.");
     process.exit(1);
   }
 
