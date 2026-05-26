@@ -398,10 +398,17 @@ function normalizeInputPath(input: string): string {
 // Partition engine — enriched with derived metrics
 //
 
+// Before (bug):
 function getPartitionableFields(row: ActivityRow): string[] {
   return Object.entries(row)
     .filter(([_, v]) => typeof v === "string" && v.length > 0)
-    .map(([k, _]) => k);
+    .map(([k, _]) => k);  // → includes "duration", "start", "end" — garbage!
+}
+
+// After (fixed):
+function getPartitionableFields(_row: ActivityRow): string[] {
+  // Only categorical dimensions, NOT temporal measures
+  return ["activity", "description"];
 }
 
 function makePartitions(
