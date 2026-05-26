@@ -54,21 +54,19 @@ export interface GlobalAnalysis {
 }
 
 //
-// Time parser: MM:SS, HH:MM:SS, "0", ""
+// Time parser: MM:SS, HH:MM:SS, Excel serial numbers, "0", ""
 //
 
-function parseTimeToSeconds(time: string | number): number {
+export function parseTimeToSeconds(time: string | number): number {
   if (time === "" || time === null || time === undefined) return 0;
 
   if (typeof time === "number") {
-    // Excel serial: fraction of a day
     return Math.round(time * 24 * 60 * 60);
   }
 
   const t = String(time).trim();
   if (!t || t === "0") return 0;
 
-  // Numeric string that looks like Excel serial (small fraction, no colons)
   const asNum = Number(t);
   if (!Number.isNaN(asNum) && asNum > 0 && asNum < 1 && !t.includes(":")) {
     return Math.round(asNum * 24 * 60 * 60);
@@ -92,7 +90,7 @@ function parseTimeToSeconds(time: string | number): number {
 }
 
 //
-// Robust CSV tokenizer
+// Robust CSV tokenizer (RFC-4180-ish)
 //
 
 function parseCsvLine(line: string): string[] {
@@ -173,41 +171,54 @@ export function parseSessionCsv(csvText: string, fileName: string): Session {
 
 //
 // XLSX → CSV text conversion
-// Uses SheetJS's CSV exporter which handles formatting (times as "1:03:26")
 //
 
 function xlsxToCsvText(buffer: Buffer): string {
   const workbook = XLSX.read(buffer, { type: "buffer" });
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
-  // SheetJS CSV export uses formatted cell values by default — times come out as "HH:MM:SS"
   return XLSX.utils.sheet_to_csv(sheet);
 }
 
 //
-// File discovery: returns CSV text for ALL source types
+// Path normalization: Windows C:\ → /mnt/c/
+//
+
+function normalizeInputPath(input: string): string {
+  const winMatch = input.match(/^([A-Za-z]):\\(.*)$/);
+  if (winMatch) {
+    const [, drive, rest] = winMatch;
+    return `/mnt/${drive.toLowerCase()}/${rest.replaceAll("\\", "/")}`;
+  }
+  return input;
+}
+
+//
+// File discovery: recursive, case-insensitive extensions
 //
 
 async function findSources(inputPath: string): Promise<{ path: string; text: string }[]> {
   const s = await stat(inputPath);
 
   if (s.isFile()) {
-    if (inputPath.endsWith(".csv")) {
+    const ext = extname(inputPath).toLowerCase();
+    if (ext === ".csv") {
       return [{ path: inputPath, text: await readFile(inputPath, "utf8") }];
     }
-    if (inputPath.endsWith(".xlsx") || inputPath.endsWith(".xls")) {
+    if (ext === ".xlsx" || ext === ".xls") {
       const buf = await readFile(inputPath);
       return [{ path: inputPath, text: xlsxToCsvText(buf) }];
     }
-    if (inputPath.endsWith(".zip")) {
+    if (ext === ".zip") {
       const zipBuffer = await readFile(inputPath);
       const extracted = unzipSync(zipBuffer);
       const results: { path: string; text: string }[] = [];
       for (const [name, buffer] of Object.entries(extracted)) {
-        if (name.endsWith(".csv")) {
+        const innerExt = extname(name).toLowerCase();
+        if (innerExt === ".csv") {
           results.push({ path: `${inputPath}#${name}`, text: buffer.toString("utf8") });
         }
-        if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
+        if (innerExt === ".xlsx" || innerExt === ".xls") {
           results.push({ path: `${inputPath}#${name}`, text: xlsxToCsvText(buffer) });
         }
       }
@@ -223,7 +234,8 @@ async function findSources(inputPath: string): Promise<{ path: string; text: str
       entries.map(async entry => {
         const full = join(inputPath, entry.name);
         if (entry.isDirectory()) return findSources(full);
-        if (entry.isFile() && (full.endsWith(".csv") || full.endsWith(".xlsx") || full.endsWith(".xls") || full.endsWith(".zip"))) {
+        const ext = extname(full).toLowerCase();
+        if (entry.isFile() && (ext === ".csv" || ext === ".xlsx" || ext === ".xls" || ext === ".zip")) {
           return findSources(full);
         }
         return [];
@@ -236,16 +248,26 @@ async function findSources(inputPath: string): Promise<{ path: string; text: str
 }
 
 //
-// Path normalization
+// Auto-discovery: scan current directory (non-recursive)
 //
 
-function normalizeInputPath(input: string): string {
-  const winMatch = input.match(/^([A-Za-z]):\\(.*)$/);
-  if (winMatch) {
-    const [, drive, rest] = winMatch;
-    return `/mnt/${drive.toLowerCase()}/${rest.replaceAll("\\", "/")}`;
+async function autoFindSources(): Promise<{ path: string; text: string }[]> {
+  const cwd = process.cwd();
+  const entries = await readdir(cwd, { withFileTypes: true });
+
+  const pending: Promise<{ path: string; text: string }[]>[] = [];
+
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const full = join(cwd, entry.name);
+    const ext = extname(full).toLowerCase();
+    if (ext === ".csv" || ext === ".xlsx" || ext === ".xls" || ext === ".zip") {
+      pending.push(findSources(full));
+    }
   }
-  return input;
+
+  const results = await Promise.all(pending);
+  return results.flat();
 }
 
 //
@@ -383,19 +405,25 @@ function renderGlobal(a: GlobalAnalysis): string {
 //
 
 async function main() {
-  const rawInput = process.argv[2] ?? ".";
-  const root = normalizeInputPath(rawInput);
+  const rawInput = process.argv[2];
 
-  console.error(`Scanning: ${root}`);
+  let sources: { path: string; text: string }[];
 
-  const sources = await findSources(root);
+  if (rawInput) {
+    const root = normalizeInputPath(rawInput);
+    console.error(`Scanning: ${root}`);
+    sources = await findSources(root);
+  } else {
+    console.error(`Auto-scanning: ${process.cwd()}`);
+    sources = await autoFindSources();
+  }
+
   console.error(`Found ${sources.length} source(s)`);
 
   const sessions: Session[] = [];
 
   for (const source of sources) {
     try {
-      // ALL paths go through parseSessionCsv — XLSX is converted to CSV first
       const session = parseSessionCsv(source.text, source.path);
       sessions.push(session);
       console.error(`  ✓ ${source.path} → ${session.activities.length} activities`);
