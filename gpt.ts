@@ -54,22 +54,21 @@ export interface GlobalAnalysis {
 }
 
 //
-// Time parser: handles MM:SS, HH:MM:SS, Excel serial numbers, "0", ""
+// Time parser: MM:SS, HH:MM:SS, "0", ""
 //
 
 function parseTimeToSeconds(time: string | number): number {
   if (time === "" || time === null || time === undefined) return 0;
 
-  // Excel stores times as fractions of a day (e.g., 0.000231481... = 20 seconds)
   if (typeof time === "number") {
-    // Convert fraction of day to seconds
+    // Excel serial: fraction of a day
     return Math.round(time * 24 * 60 * 60);
   }
 
   const t = String(time).trim();
   if (!t || t === "0") return 0;
 
-  // Handle Excel serial numbers passed as strings
+  // Numeric string that looks like Excel serial (small fraction, no colons)
   const asNum = Number(t);
   if (!Number.isNaN(asNum) && asNum > 0 && asNum < 1 && !t.includes(":")) {
     return Math.round(asNum * 24 * 60 * 60);
@@ -125,7 +124,7 @@ function parseCsvLine(line: string): string[] {
 }
 
 //
-// Parse CSV text into Session
+// Parse CSV text into Session — THE ONE AND ONLY PARSER
 //
 
 export function parseSessionCsv(csvText: string, fileName: string): Session {
@@ -173,62 +172,23 @@ export function parseSessionCsv(csvText: string, fileName: string): Session {
 }
 
 //
-// Parse XLSX directly — uses formatted values (not raw) for time columns
+// XLSX → CSV text conversion
+// Uses SheetJS's CSV exporter which handles formatting (times as "1:03:26")
 //
 
-function parseSessionXlsx(buffer: Buffer, fileName: string): Session {
+function xlsxToCsvText(buffer: Buffer): string {
   const workbook = XLSX.read(buffer, { type: "buffer" });
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
-
-  // Use formatted text (not raw numbers) — this gives "1:03:26" not 0.00023...
-  const aoa: (string | number | undefined)[][] = XLSX.utils.sheet_to_json(sheet, {
-    header: 1,
-    defval: "",
-    raw: false, // <-- KEY: get formatted strings for times
-  });
-
-  if (aoa.length < 3) {
-    throw new Error(`Too few rows in ${fileName}: ${aoa.length} rows (need at least 3)`);
-  }
-
-  const sessionName = String(aoa[0][0] ?? "").trim() || basename(fileName, extname(fileName));
-  const rows: ActivityRow[] = [];
-
-  for (let i = 2; i < aoa.length; i++) {
-    const row = aoa[i];
-    if (!row || row.every(c => c === "" || c === undefined || c === null)) continue;
-
-    const activity = String(row[0] ?? "").trim();
-    const description = String(row[1] ?? "").trim();
-    const start = String(row[2] ?? "00:00").trim();
-    const end = String(row[3] ?? "00:00").trim();
-    const duration = String(row[4] ?? "00:00").trim();
-    const pixels = Number(row[5] ?? 0) || 0;
-
-    if (!activity && !description && !start && !end && !duration && pixels === 0) continue;
-
-    rows.push({
-      activity,
-      description,
-      start: start as TimeString,
-      end: end as TimeString,
-      duration: duration as TimeString,
-      pixels,
-      startSeconds: parseTimeToSeconds(start),
-      endSeconds: parseTimeToSeconds(end),
-      durationSeconds: parseTimeToSeconds(duration),
-    });
-  }
-
-  return { name: sessionName, file: fileName, activities: rows };
+  // SheetJS CSV export uses formatted cell values by default — times come out as "HH:MM:SS"
+  return XLSX.utils.sheet_to_csv(sheet);
 }
 
 //
-// File discovery
+// File discovery: returns CSV text for ALL source types
 //
 
-async function findSources(inputPath: string): Promise<{ path: string; text?: string; buffer?: Buffer }[]> {
+async function findSources(inputPath: string): Promise<{ path: string; text: string }[]> {
   const s = await stat(inputPath);
 
   if (s.isFile()) {
@@ -236,18 +196,19 @@ async function findSources(inputPath: string): Promise<{ path: string; text?: st
       return [{ path: inputPath, text: await readFile(inputPath, "utf8") }];
     }
     if (inputPath.endsWith(".xlsx") || inputPath.endsWith(".xls")) {
-      return [{ path: inputPath, buffer: await readFile(inputPath) }];
+      const buf = await readFile(inputPath);
+      return [{ path: inputPath, text: xlsxToCsvText(buf) }];
     }
     if (inputPath.endsWith(".zip")) {
       const zipBuffer = await readFile(inputPath);
       const extracted = unzipSync(zipBuffer);
-      const results: { path: string; text?: string; buffer?: Buffer }[] = [];
+      const results: { path: string; text: string }[] = [];
       for (const [name, buffer] of Object.entries(extracted)) {
         if (name.endsWith(".csv")) {
           results.push({ path: `${inputPath}#${name}`, text: buffer.toString("utf8") });
         }
         if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
-          results.push({ path: `${inputPath}#${name}`, buffer });
+          results.push({ path: `${inputPath}#${name}`, text: xlsxToCsvText(buffer) });
         }
       }
       if (results.length === 0) throw new Error(`No CSV/XLSX files found inside zip: ${inputPath}`);
@@ -434,14 +395,8 @@ async function main() {
 
   for (const source of sources) {
     try {
-      let session: Session;
-      if (source.buffer) {
-        session = parseSessionXlsx(source.buffer, source.path);
-      } else if (source.text) {
-        session = parseSessionCsv(source.text, source.path);
-      } else {
-        throw new Error(`No data for ${source.path}`);
-      }
+      // ALL paths go through parseSessionCsv — XLSX is converted to CSV first
+      const session = parseSessionCsv(source.text, source.path);
       sessions.push(session);
       console.error(`  ✓ ${source.path} → ${session.activities.length} activities`);
     } catch (e) {
